@@ -13,7 +13,7 @@ import ble_advertising
 
 
 class Ble:
-    # Define constants for BLE IRQ
+    # Define constants for BLE Interrupt Requests
     IRQ_ALL = const(0xffff)
     IRQ_CENTRAL_CONNECT                 = const(1 << 0)
     IRQ_CENTRAL_DISCONNECT              = const(1 << 1)
@@ -38,6 +38,7 @@ class Ble:
     # CHAR_STATUS_CHANGE = (ubluetooth.UUID(UUID_VALUE_CHAR_STATUS_CHANGE), ubluetooth.FLAG_READ,)
     # SERVICE_GEN = (UUID_SERVICE_GEN, (CHAR_STATUS_CHANGE,),)
 
+    # NOTE: WHEN UPDATING UUIDS, ENSURE THE DEVICE NAME IS CORRECT (see advertise())
     UUID_VALUE_SERVICE = "87916f94-2485-4e33-b6b8-9d4bd3f7a148"
     UUID_VALUE_CHAR_STATUS = "f7ef1eb9-c7ce-42a3-b781-7426420837ab"
     UUID_VALUE_CHAR_SETTINGS = "96797478-bd6c-4b0a-a3e9-018b56eacdf7"
@@ -50,12 +51,20 @@ class Ble:
     BLE_SERVICES = (BLE_SERVICE,)
 
     ### Initialize variables
-    ble = ubluetooth.BLE() # BLE singleton
+    _ble = ubluetooth.BLE() # BLE singleton
     connected = False
     connections = set()
     handle_status = 0
     handle_settings = 0
     handle_roast = 0
+
+    # active needs separate getter and setters
+    @property
+    def active(self):
+        return self._ble.active()
+    @active.setter
+    def active(self, active):
+        self._ble.active(active)
     
     # command should have a callback
     @property
@@ -74,12 +83,9 @@ class Ble:
 
     ### BLE methods
     def register(self):
-        ((self.handle_status, self.handle_settings, self.handle_roast),) = self.ble.gatts_register_services(self.BLE_SERVICES)
-        self.ble.irq(self.irq, self.IRQ_ALL)
-        print('BLE current mac address: ', self.ble.config('mac'))
-        print("handle_status: ", self.handle_status)
-        print("handle_settings: ", self.handle_settings)
-        print("handle_roast: ", self.handle_roast)
+        ((self.handle_status, self.handle_settings, self.handle_roast),) = self._ble.gatts_register_services(self.BLE_SERVICES)
+        self._ble.irq(self.irq, self.IRQ_ALL)
+        # log_custom('BLE current mac address: %s' % self._ble.config('mac'))
 
     def advertise(self):
         # Indicate GATT service name in reverse byte order in second argument of adv_encode(0x03, b'')
@@ -90,27 +96,40 @@ class Ble:
             name="Vk",
             services=[self.BLE_UUID_SERVICE],
         )
-        self.ble.gap_advertise(100, payload)
+        self._ble.gap_advertise(100, payload)
     
     def notify(self, handle, data):
-        print('Ble - notify')
         for conn_handle in self.connections:
-            print('Ble - notifying conn_handle: ', conn_handle)
-            print('Ble - notifying handle: ', handle)
-            print('Ble - notifying data: ', data)
-            # Notify all connected centrals
-            self.ble.gatts_notify(conn_handle, handle, data)
+            # If the char handle is 0, it was not set
+            if handle > 0:
+                print('Ble - notifying data: %s' % data)
+                # logger.info('Ble - notifying data: %s' % data)
+                # Write the updated value to the characteristic
+                # before notifying all connected centrals
+                self._ble.gatts_write(handle, data)
+                self._ble.gatts_notify(conn_handle, handle, data)
+    
+    def write(self, handle, data):
+         # If the char handle is 0, it was not set
+        if handle > 0:
+            print('Ble - write data: %s' % data)
+            # logger.info('Ble - write data: %s' % data)
+            # Write the updated value to the characteristic
+            self._ble.gatts_write(handle, data)
 
     # Main event handler function
     def irq(self, event, data):
-        print('bt irq', event, data)
+        print('bt irq: %s, %s' % (event, data))
+        # logger.info('bt irq: %s, %s' % (event, data))
         if event == self.IRQ_CENTRAL_CONNECT:
             # A central has connected to this peripheral.
             conn_handle, addr_type, addr = data
             # Add the connection to the list
             self.connections.add(conn_handle)
             self.connected = True
-            print('_IRQ_CENTRAL_CONNECT: ', conn_handle, addr_type, addr)
+            print('_IRQ_CENTRAL_CONNECT: %s, %s, %s' % (conn_handle, addr_type, addr))
+            # logger.info('_IRQ_CENTRAL_CONNECT') #: %s, %s, %s' % (conn_handle, addr_type, addr))
+            self.command = b'READY'
         
         elif event == self.IRQ_CENTRAL_DISCONNECT:
             # A central has disconnected from this peripheral.
@@ -118,15 +137,27 @@ class Ble:
             # Remove the connection
             self.connections.remove(conn_handle)
             self.connected = False
-            print('_IRQ_CENTRAL_DISCONNECT: ', conn_handle, addr_type, addr)
+            print('_IRQ_CENTRAL_DISCONNECT: %s, %s, %s' % (conn_handle, addr_type, addr))
+            # logger.info('_IRQ_CENTRAL_DISCONNECT') #: %s, %s, %s' % (conn_handle, addr_type, addr))
             # Start advertising again to allow a new connection.
             self.advertise()
         
         elif event == self.IRQ_GATTS_WRITE:
             # A central has written to this characteristic or descriptor.
             conn_handle, attr_handle = data
-            print('_IRQ_GATTS_WRITE: ', conn_handle, attr_handle)
-            received_data = self.ble.gatts_read(attr_handle)
+            print('_IRQ_GATTS_WRITE: %s, %s' % (conn_handle, attr_handle))
+            # logger.info('_IRQ_GATTS_WRITE') #: %s, %s' % (conn_handle, attr_handle))
+            received_data = self._ble.gatts_read(attr_handle)
             print(received_data)
+            # logger.info(received_data)
             if attr_handle == self.handle_status:
                 self.command = received_data
+        
+        # Not currently supported on ESP32
+        elif event == self.IRQ_GATTS_READ_REQUEST:
+            # A central has issued a read. Note: this is a hard IRQ.
+            # Return None to deny the read.
+            # Note: This event is not supported on ESP32.
+            conn_handle, attr_handle = data
+            print('IRQ_GATTS_READ_REQUEST: %s, %s' % (conn_handle, attr_handle))
+            # logger.info('IRQ_GATTS_READ_REQUEST') #: %s, %s' % (conn_handle, attr_handle))

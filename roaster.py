@@ -3,7 +3,9 @@ import json
 
 from ble import Ble
 from simple_pid import PID
+import logger
 import max31855
+# import utils
 
 
 class ROASTER_STATUS():
@@ -101,6 +103,7 @@ class Roaster:
         self.ble.register_command_callback(self.ble_status_listener)
         # Set the roaster to the READY state
         self.set_READY()
+        self.set_settings_and_write()
 
     ########## SETTINGS ##########
     PIN_SYSTEM      = Pin(18, Pin.OUT) 
@@ -116,14 +119,16 @@ class Roaster:
     def set_status_and_notify(self, status):
         self.status = status
         string = ROASTER_STATUS.status_to_string(self.status)
-        
+        print("set_status_and_notify: %s" % string)
+        # logger.info("set_status_and_notify: %s" % string)
+        # utils.log_firebase('roaster-set_status_and_notify',string)
         # BLE notify the status update
         self.ble.notify(self.ble.handle_status, string)
     
     # Set a listener method for the `command` variable in Ble
     def ble_status_listener(self, new_status_bytes):
-        new_status_string = new_status_bytes.decode("utf-8")
-        print("new_status_string: ", new_status_string)
+        # log_custom("new_status_bytes: ", new_status_bytes)
+        new_status_string = new_status_bytes.decode()
         new_status = ROASTER_STATUS.string_to_status(new_status_string)
         # Do not set the status directly - call the appropriate method
         # and the status will be updated when device changes are complete
@@ -135,21 +140,8 @@ class Roaster:
             self.set_COOL()
         else:
             print("ERROR: new_status invalid")
-
-    ########## THERMOCOUPLE ##########
-    thermocouple = Max31855().thermocouple
-    # Read the thermocouple but check that the temp is not an outlier
-    # If the new reading is 10C or more different than the last
-    # stored temp, do not use the new reading, just pass the last stored temp
-    def temp_update(self):
-        temp_new = self.thermocouple.read()
-        print("temp_new: ", temp_new)
-        # Be sure to use the absolute value difference
-        # to skip outlier thermocouple readings
-        temp_diff = abs(temp_new - self.temp_current)
-        if temp_diff < 10:
-            self.temp_current = temp_new
-        print("temp_current: ", self.temp_current)
+            # logger.info("ERROR: new_status invalid")
+            # utils.log_firebase('roaster-ble_status_listener',"ERROR: new_status invalid")
 
     ########## PID & ROAST CURVE ##########
     # Set the duration (s) to heat the chamber before PID activated
@@ -167,10 +159,11 @@ class Roaster:
     PID_P = 2
     PID_I = 1
     PID_D = 10
+    temp_curve = 0.0
     #PID(double* Input, double* Output, double* Setpoint,double Kp, double Ki, double Kd, int ControllerDirection)
     #PID PID1(&tempCurrent, &output, &tempCurve, kP, kI, kD, DIRECT);
-    pid = PID(PID_P, PID_I, PID_D, setpoint=1)
-    pid.sample_time = CYCLE_DELAY / 1000 #seconds
+    pid = PID(PID_P, PID_I, PID_D, setpoint=temp_curve)
+    pid.sample_time = CYCLE_DELAY / 1000 #sample_time inputs in seconds
     pid.output_limits = (0, PID_COIL_TIME_MAX)
     
     # Bundle the PID settings into JSON format to be sent to the app
@@ -179,49 +172,71 @@ class Roaster:
             "kP": self.PID_P,
             "kI": self.PID_I,
             "kD": self.PID_D,
-            "primeTime": self.ROAST_PRIMETIME,
-            "roomTemp": self.ROAST_CURVE_TEMP_ROOM,
-            "maxTemp": self.ROAST_CURVE_TEMP_MAX,
             "curve": self.ROAST_CURVE,
+            "timePrime": self.ROAST_PRIMETIME,
             "timeMax": self.ROAST_TIME_MAX,
+            "tempRoom": self.ROAST_CURVE_TEMP_ROOM,
+            "tempMax": self.ROAST_CURVE_TEMP_MAX,
         }
         return json.dumps(j)
+    def set_settings_and_write(self):
+        # TODO: Accept settings as parameter
+        settings = self.pid_settings_create_json()
+        # log_custom("set_settings_and_write: %s" % settings)
+        # BLE write the settings to central
+        self.ble.write(self.ble.handle_settings, settings)
+
+    ########## THERMOCOUPLE ##########
+    thermocouple = Max31855().thermocouple
+    # Read the thermocouple but check that the temp is not an outlier
+    # If the new reading is 10C or more different than the last
+    # stored temp, do not use the new reading, just pass the last stored temp
+    def temp_update(self):
+        temp_new = self.thermocouple.read()
+        # log_custom("temp_new: ", temp_new)
+        # Be sure to use the absolute value difference
+        # to skip outlier thermocouple readings
+        temp_diff = abs(temp_new - self.temp_current)
+        if temp_diff < 10:
+            self.temp_current = temp_new
+        # log_custom("temp_current: ", self.temp_current)
 
     ########## ROAST DATA ##########
     coil = COIL.OFF
-    time_current = 0         # Time since last reset
-    time_start = 0           # Time of roast start
-    time_roast = 0           # Roast duration
-    time_last = 0            # Time of last measurement
-    time_last_notify = 0     # Time of last notification
-    time_coil_on = 0         # Time coil turned on
+    time_current = 0.0         # Time since last reset
+    time_start = 0.0           # Time of roast start
+    time_roast = 0.0           # Roast duration
+    time_last = 0.0            # Time of last measurement
+    time_last_notify = 0.0     # Time of last notification
+    time_coil_on = 0.0         # Time coil turned on
 
-    temp_curve = 0.0
     temp_initial = 0.0
     temp_last = 0.0
     temp_current = 0.0
 
     def roast_notify(self):
-        print("Roaster - roast_notify")
         if self.ble.connected:
-            print("Roaster - roast_notify - connected")
             # Bluetooth stack will go into congestion if too many packets are sent (>=100ms)
             # Notify every: .5 second (needs to be faster than app data so that timing issues don't cause <1 sec app data)
-            if self.temp_current - self.time_last_notify < 500:
-                print("Roaster - roast_notify - temp check")
+            # log_custom("time_last_notify: %f" % self.time_last_notify)
+            if self.time_current - self.time_last_notify > 500:
                 # Convert the RoastReading components to json and notify
                 d = {
                     "time": self.time_roast,
                     "temp": self.temp_current,
+                    "tempCurve": self.temp_curve,
+                    "pidOutput": self.PID_OUTPUT,
                 }
                 self.ble.notify(self.ble.handle_roast, json.dumps(d))
                 # Update the notification time to the data gathered time
                 self.time_last_notify = self.time_current
+        else:
+            print("roast_notify - not connected")
+            # logger.info("roast_notify - not connected")
+            # utils.log_firebase('roaster-roast_notify',"not connected")
     
     # Run continuously when on ROAST
     def roast_cycle(self):
-        print("ROAST CYCLE")
-
         # Calculate the amount of time the beans have been roasting
         self.time_roast = self.time_current - self.time_start
 
@@ -229,7 +244,8 @@ class Roaster:
         # updateTemp()
 
         # If the maximum allowed time has been reached, start the cool cycle
-        if self.time_roast >= self.ROAST_TIME_MAX:
+        # ROAST_TIME_MAX is in seconds, so convert to milliseconds
+        if self.time_roast >= self.ROAST_TIME_MAX * 1000:
             self.set_COOL()
         elif self.time_roast < (self.ROAST_PRIMETIME * 1000):
             # Chamber Priming: First run a standard program to stabilize the temp at expected (half fill) level
@@ -252,19 +268,30 @@ class Roaster:
                 # Calculate the ideal roast curve temp based on the passed roast time
                 # tempCurve = tempInitial + ((250 * (timeRoast / 1000)) / (100 + (timeRoast / 1000)))
                 self.temp_curve = self.ROAST_CURVE_TEMP_ROOM + ((self.ROAST_CURVE_TEMP_MAX * (self.time_roast / 1000)) / (self.ROAST_CURVE + (self.time_roast / 1000)))
-            
+                self.pid.setpoint = self.temp_curve
+
                 # The PID equation will estimate how many additional seconds the coil needs to be on
                 # to match the roast curve target temp. The PID equation will max out at 60 seconds
                 # so if the output is equal to 60, just keep the coil on.
-            
+
+                # Get the PID output
+                self.PID_OUTPUT = self.pid(self.temp_current)
+                print("ROAST CYCLE - temp_curve, temp_current, PID_OUTPUT: %f, %f, %f" % (self.temp_curve, self.temp_current, self.PID_OUTPUT))
+                # logger.info("ROAST CYCLE - temp_curve, temp_current, PID_OUTPUT: %f, %f, %f" % (self.temp_curve, self.temp_current, self.PID_OUTPUT))
+                # utils.log_firebase('roaster-roast_cycle',"temp_curve, temp_current, PID_OUTPUT: %f, %f, %f" % (self.temp_curve, self.temp_current, self.PID_OUTPUT))
                 # IMPORTANT: Multiply the output by 1000 to convert from seconds to microseconds
                 self.PID_COIL_TIME_EST = self.PID_OUTPUT * 1000
+                # control = pid(v)
+                # # feed the PID output to the system and get its current value
+                # v = controlled_system.update(control)
             
                 # Determine if the coil should be on or not
                 # If the estimated coil time is 60, that is the max, so just keep the coil on
                 if self.PID_COIL_TIME_EST >= 60:
                     self.PIN_COIL.value(1)
-                    print("COIL ON")
+                    print(">60 COIL ON")
+                    # logger.info(">60 COIL ON")
+                    # utils.log_firebase('roaster-roast_cycle',"COIL ON")
                 elif self.PID_COIL_TIME_EST > self.time_current - self.time_coil_on:
                     # If the estimated coil time on is greater than the time passed since it was last turned on, it should be on
                     # Check whether the coil is already on, if not, turn it on and reset the coil time on indicator
@@ -274,6 +301,8 @@ class Roaster:
                         self.coil = COIL.ON
                     
                     print("COIL ON")
+                    # logger.info("COIL ON")
+                    # utils.log_firebase('roaster-roast_cycle',"COIL ON")
                 
                 else:
                     # If the estimated coil time on is less than or equal to the time passed since it was last turned on, it should be off
@@ -281,6 +310,7 @@ class Roaster:
                     self.PIN_COIL.value(0)
                     self.coil = COIL.OFF
                     print("COIL OFF")
+                    # logger.info("COIL OFF")
                 
                 self.time_last = self.time_current
 
@@ -292,7 +322,7 @@ class Roaster:
 
         # Set status and notify
         self.set_status_and_notify(ROASTER_STATUS.NA)
-        print("SYSTEM STATUS NA")
+        logger.info("SYSTEM STATUS NA")
     
     # Run ONCE when the device is set to READY
     def set_READY(self):
@@ -304,7 +334,7 @@ class Roaster:
 
         # Set status and notify
         self.set_status_and_notify(ROASTER_STATUS.READY)
-        print("SYSTEM STATUS READY")
+        logger.info("SYSTEM STATUS READY")
     
     # Run ONCE when the device is set to ROAST
     def set_ROAST(self):
@@ -312,12 +342,12 @@ class Roaster:
         # (last reading time is needed to limit the relay toggle time)
         self.time_start = self.time_current
         self.time_last = self.time_current
-        self.time_last_notify = self.time_current
+        # self.time_last_notify = self.time_current
         # Update the temp reading
         self.temp_update()
         # Set the roast initial temp to the current temp
         self.temp_initial = self.temp_current
-        print("Initial Temp = ", self.temp_initial)
+        logger.info("Initial Temp = %f" % self.temp_initial)
 
         # Turn on the coils and switch the LED
         self.PIN_SYSTEM.value(1)
@@ -325,7 +355,7 @@ class Roaster:
 
         # Set status and notify
         self.set_status_and_notify(ROASTER_STATUS.ROAST)
-        print("SYSTEM STATUS ROAST")
+        logger.info("SYSTEM STATUS ROAST")
 
         # Run the roast cycle the first time (loop will continue directly)
         self.roast_cycle()
@@ -348,7 +378,7 @@ class Roaster:
         self.color_led.yellow()
         # set the stage to cooling
         self.set_status_and_notify(ROASTER_STATUS.COOL)
-        print("SYSTEM STATUS COOLING")
+        logger.info("SYSTEM STATUS COOLING")
 
         # Start the first cool cycle (loop will continue)
         self.cool_cycle()
